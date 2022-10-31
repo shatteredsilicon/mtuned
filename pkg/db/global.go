@@ -25,6 +25,7 @@ type GlobalVariables struct {
 	InnodbIOCapacityMax    uint64 `db:"@@innodb_io_capacity_max"`
 	InnodbIOCapacity       uint64 `db:"@@innodb_io_capacity"`
 	LargePages             bool   `db:"@@large_pages"`
+	InnodbPageSize         uint   `db:"@@innodb_page_size"`
 }
 
 // GlobalStatus structure of global status
@@ -61,7 +62,8 @@ SELECT @@innodb_buffer_pool_size, @@innodb_log_buffer_size, @@key_buffer_size, %
 	@@sort_buffer_size, @@tmp_table_size, @@table_open_cache, @@table_definition_cache,
 	@@innodb_log_file_size, @@innodb_flush_neighbors, @@innodb_buffer_pool_instances,
 	@@innodb_io_capacity_max, @@innodb_io_capacity, @@innodb_buffer_pool_chunk_size,
-	@@innodb_log_files_in_group, @@large_pages, @@table_open_cache_instances;
+	@@innodb_log_files_in_group, @@large_pages, @@table_open_cache_instances,
+	@@innodb_page_size;
 `, queryCacheSizeQuery)
 
 	err = e.Get(&gvs, query)

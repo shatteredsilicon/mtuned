@@ -3,12 +3,13 @@ package tuner
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"io"
 	"mtuned/pkg/config"
 	"mtuned/pkg/db"
 	"mtuned/pkg/log"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,6 +27,10 @@ const (
 	broadcastDataIOState = "ioState"
 )
 
+var (
+	ssdRegexp = regexp.MustCompile(`Rotation Rate:\s*Solid State Device`)
+)
+
 // Tuner tuner for tuned parameter
 type Tuner interface {
 	Run()
@@ -37,6 +42,11 @@ type ioState struct {
 	currentIOSpeed float64
 }
 
+type device struct {
+	name      string
+	zfsVolume *string
+}
+
 type service struct {
 	ctx           context.Context
 	tuners        []Tuner
@@ -44,6 +54,9 @@ type service struct {
 	broadcastChan chan broadcastData
 	ioState       ioState
 	listenerMap   map[unsafe.Pointer]struct{}
+	device        device
+	bold          bool
+	db            *db.DB
 }
 
 type broadcastData struct {
@@ -58,50 +71,30 @@ type Service struct {
 
 // NewService returns a new service of tuner
 func NewService(ctx context.Context, cfg *config.Config) (*Service, error) {
-	storage := cfg.SSD
-	if storage == config.StorageAutoDetect {
-		storageCmd := exec.Command("hdparm", "-I", "/dev/sdb")
-		grepCmd := exec.Command("grep", "Rotation")
+	pool := db.NewDB()
 
-		r, w := io.Pipe()
-		storageCmd.Stdout = w
-		grepCmd.Stdin = r
+	var dataDir struct {
+		Path string `db:"@@datadir"`
+	}
+	err := pool.Get(&dataDir, "SELECT @@datadir;")
+	if err != nil {
+		return nil, err
+	}
 
-		err := storageCmd.Start()
-		if err == nil {
-			err = grepCmd.Start()
-		} else {
-			storageCmd = exec.Command("smartctl", "-i", "/dev/sdb")
-			err = storageCmd.Start()
-			if err == nil {
-				err = grepCmd.Start()
-			}
-		}
+	dev, err := detectDevice(dataDir.Path)
+	if err != nil {
+		return nil, err
+	}
+
+	var storage int8
+	if cfg.SSD == config.StorageAutoDetect {
+		storage, err = detectStorage(dev.name)
 		if err != nil {
-			return nil, err
+			log.Logger().Error("can't detect storage type, using default", zap.NamedError("error", err))
+			storage = config.StorageSpinning
 		}
-
-		var output bytes.Buffer
-		grepCmd.Stdout = &output
-
-		err = storageCmd.Wait()
-		if err != nil {
-			return nil, err
-		}
-
-		err = w.Close()
-		if err != nil {
-			return nil, err
-		}
-
-		err = grepCmd.Wait()
-		if err != nil {
-			return nil, err
-		}
-
-		if strings.Contains(output.String(), "Solid State Device") {
-			storage = config.StorageSSD
-		}
+	} else {
+		storage = int8(cfg.SSD)
 	}
 
 	hpAlloc, err := hugePageAllocation()
@@ -109,28 +102,30 @@ func NewService(ctx context.Context, cfg *config.Config) (*Service, error) {
 		return nil, err
 	}
 
-	db := db.NewDB()
 	svc := &Service{
 		service: service{
 			ctx:         ctx,
 			storage:     uint8(storage),
 			listenerMap: make(map[unsafe.Pointer]struct{}),
+			device:      *dev,
+			bold:        cfg.Bold,
+			db:          pool,
 		},
 	}
 
 	svc.tuners = []Tuner{
-		NewMaxConnectionsTuner(ctx, db, cfg.Interval.MaxConnections),
-		NewInnodbBufPoolSizeTuner(ctx, db, cfg.Interval.InnodbBufPoolSize, hpAlloc),
-		NewTableOpenCacheTuner(ctx, db, cfg.Interval.TableOpenCache),
-		NewKeyBufferSizeTuner(ctx, db, cfg.Interval.KeyBufSize),
-		NewTableDefinitionCacheTuner(ctx, db, cfg.Interval.TableDefCache),
-		NewInnodbFlushNeighborsTuner(ctx, db, cfg.Interval.InnodbflushNBR, int8(storage)),
-		NewInnodbBufPoolInstsTuner(ctx, db, cfg.Interval.InnodbBufPoolInst),
-		NewInnodbIOCapacityMaxTuner(ctx, db, cfg.Interval.InnodbIOCapMax, svc.listenerRegister),
-		NewTableOpenCacheInstsTuner(ctx, db, cfg.Interval.TableOpenCacheInst),
-		NewInnodbIOCapacityTuner(ctx, db, cfg.Interval.InnodbIOCap),
-		NewInnodbLogBufferSizeTuner(ctx, db, cfg.Interval.InnodbLogBufSize),
-		NewInnodbLogFileSizeTuner(ctx, db, cfg.Interval.InnodbLogFileSize),
+		NewMaxConnectionsTuner(ctx, pool, cfg.Interval.MaxConnections),
+		NewInnodbBufPoolSizeTuner(ctx, pool, cfg.Interval.InnodbBufPoolSize, hpAlloc),
+		NewTableOpenCacheTuner(ctx, pool, cfg.Interval.TableOpenCache),
+		NewKeyBufferSizeTuner(ctx, pool, cfg.Interval.KeyBufSize),
+		NewTableDefinitionCacheTuner(ctx, pool, cfg.Interval.TableDefCache),
+		NewInnodbFlushNeighborsTuner(ctx, pool, cfg.Interval.InnodbflushNBR, storage),
+		NewInnodbBufPoolInstsTuner(ctx, pool, cfg.Interval.InnodbBufPoolInst),
+		NewInnodbIOCapacityMaxTuner(ctx, pool, cfg.Interval.InnodbIOCapMax, svc.listenerRegister),
+		NewTableOpenCacheInstsTuner(ctx, pool, cfg.Interval.TableOpenCacheInst),
+		NewInnodbIOCapacityTuner(ctx, pool, cfg.Interval.InnodbIOCap),
+		NewInnodbLogBufferSizeTuner(ctx, pool, cfg.Interval.InnodbLogBufSize),
+		NewInnodbLogFileSizeTuner(ctx, pool, cfg.Interval.InnodbLogFileSize),
 	}
 	svc.broadcastChan = make(chan broadcastData, len(svc.listenerMap))
 
@@ -138,27 +133,32 @@ func NewService(ctx context.Context, cfg *config.Config) (*Service, error) {
 }
 
 // Run runs all tuners
-func (ts *Service) Run() {
-	for _, tuner := range ts.tuners {
+func (s *Service) Run() {
+	go s.inferIOState()
+	go s.tuneQueryCache()
+	go s.tuneZFS()
+	go s.tuneOS()
+
+	for _, tuner := range s.tuners {
 		go tuner.Run()
 	}
 
-	go ts.inferIOState()
-	ticker := time.NewTicker(time.Duration(DefaultTuneInterval) * time.Second)
 	for {
+		ticker := time.NewTicker(2 * time.Duration(DefaultTuneInterval) * time.Second)
+
 		select {
 		case <-ticker.C:
-		case <-ts.ctx.Done():
+		case <-s.ctx.Done():
 			return
 		}
 
-		go ts.inferIOState()
+		go s.inferIOState()
 	}
 }
 
-func (ts *Service) broadcast(data broadcastData) {
-	for range ts.listenerMap {
-		ts.broadcastChan <- data
+func (s *Service) broadcast(data broadcastData) {
+	for range s.listenerMap {
+		s.broadcastChan <- data
 	}
 }
 
@@ -174,9 +174,9 @@ func (bu byUtilDesc) Len() int           { return len(bu) }
 func (bu byUtilDesc) Less(i, j int) bool { return bu[i].util > bu[j].util }
 func (bu byUtilDesc) Swap(i, j int)      { bu[i], bu[j] = bu[j], bu[i] }
 
-func (ts *Service) inferIOState() {
+func (s *Service) inferIOState() {
 	var buffer bytes.Buffer
-	iostatCmd := exec.Command("iostat", "-x", "1", "sdb")
+	iostatCmd := exec.Command("iostat", "-x", "1", s.device.name)
 	iostatCmd.Stdout = &buffer
 	iostatCmd.Stderr = &buffer
 
@@ -215,7 +215,7 @@ func (ts *Service) inferIOState() {
 	iostats := make([]iostat, 0)
 	for _, line := range strings.Split(buffer.String(), "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "sdb") {
+		if !strings.HasPrefix(line, s.device.name) {
 			continue
 		}
 
@@ -269,26 +269,278 @@ func (ts *Service) inferIOState() {
 	}
 
 	ist.maxIOSpeed = totalSpeed / totalUtil * 100
-	ts.ioState = ist
-	ts.broadcast(broadcastData{
+	s.ioState = ist
+	s.broadcast(broadcastData{
 		name:  broadcastDataIOState,
-		value: ts.ioState,
+		value: s.ioState,
 	})
 }
 
-func (ts *Service) listenerRegister(p unsafe.Pointer) func(p unsafe.Pointer) <-chan broadcastData {
-	ts.listenerMap[p] = struct{}{}
-	return ts.broadcastChannel
+func (s *Service) listenerRegister(p unsafe.Pointer) func(p unsafe.Pointer) <-chan broadcastData {
+	s.listenerMap[p] = struct{}{}
+	return s.broadcastChannel
 }
 
-func (ts *Service) broadcastChannel(p unsafe.Pointer) <-chan broadcastData {
-	_, ok := ts.listenerMap[p]
+func (s *Service) broadcastChannel(p unsafe.Pointer) <-chan broadcastData {
+	_, ok := s.listenerMap[p]
 	if !ok {
 		log.Logger().Warn("Not registered listener trying to get broadcast message")
 		return nil
 	}
 
-	return ts.broadcastChan
+	return s.broadcastChan
+}
+
+type lsblkLine struct {
+	kname  string
+	fstype string
+	mp     string
+}
+type byMountPoint []lsblkLine
+
+func (bmp byMountPoint) Len() int           { return len(bmp) }
+func (bmp byMountPoint) Less(i, j int) bool { return len(bmp[i].mp) > len(bmp[j].mp) }
+func (bmp byMountPoint) Swap(i, j int)      { bmp[i], bmp[j] = bmp[j], bmp[i] }
+
+func detectDevice(dataDir string) (dev *device, err error) {
+	output, err := exec.Command("lsblk", "-d", "-o", "KNAME,FSTYPE,MOUNTPOINT").Output()
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(string(output), "\n")
+	if len(lines) < 2 {
+		return nil, errors.New("no device found")
+	}
+
+	lsblkLines := make([]lsblkLine, 0)
+	for _, line := range lines[1:] {
+		parts := strings.Fields(line)
+		if len(parts) < 1 {
+			continue
+		}
+
+		lsblkLine := lsblkLine{
+			kname: parts[0],
+		}
+		if len(parts) > 1 {
+			lsblkLine.fstype = parts[1]
+		}
+		if len(parts) > 2 {
+			lsblkLine.mp = parts[2]
+		}
+		lsblkLines = append(lsblkLines, lsblkLine)
+	}
+
+	if len(lsblkLines) == 0 {
+		return nil, errors.New("no valid device found")
+	}
+
+	sort.Sort(byMountPoint(lsblkLines))
+	var isZFS bool
+	for _, line := range lsblkLines {
+		if strings.HasPrefix(dataDir, line.mp) {
+			dev = &device{
+				name: line.kname,
+			}
+			isZFS = strings.HasPrefix(line.mp, "zfs")
+			break
+		}
+	}
+
+	if dev == nil {
+		return nil, errors.New("no device matches datadir")
+	}
+
+	if !isZFS {
+		return dev, nil
+	}
+
+	output, err = exec.Command("zfs", "list", dataDir).Output()
+	if err != nil {
+		return nil, err
+	}
+
+	lines = strings.Split(string(output), "\n")
+	if len(lines) < 2 {
+		return dev, errors.New("no zfs volume matches datadir")
+	}
+
+	parts := strings.Fields(lines[1])
+	if len(parts) != 5 {
+		return nil, errors.New("invalid zfs list command output")
+	}
+
+	zfsVolume := parts[0]
+	dev.zfsVolume = &zfsVolume
+	return
+}
+
+func detectStorage(deviceName string) (storage int8, err error) {
+	output, err := exec.Command("smartctl", "-i", fmt.Sprintf("/dev/%s", deviceName)).Output()
+	if err != nil {
+		return config.StorageUnknown, err
+	}
+
+	matched := ssdRegexp.Find(output)
+	if matched != nil && len(matched) > 0 {
+		storage = config.StorageSSD
+	} else {
+		storage = config.StorageSpinning
+	}
+
+	return storage, nil
+}
+
+func (s *Service) tuneQueryCache() {
+	if !s.bold {
+		return
+	}
+
+	rows := make([]db.GlobalRow, 0)
+
+	err := s.db.Select(&rows, "SHOW VARIABLES LIKE 'query_cache_%';")
+	if err != nil {
+		log.Logger().Error("check if query_cache_size/query_cache_type variables exist failed", zap.NamedError("error", err))
+		return
+	}
+
+	var queries []string
+	for _, row := range rows {
+		if row.Name == "query_cache_size" {
+			queries = append(queries, "query_cache_size = 0")
+		} else if row.Name == "query_cache_type" {
+			queries = append(queries, "query_cache_type = 0")
+		}
+	}
+	if len(queries) == 0 {
+		return
+	}
+
+	_, err = s.db.Exec(fmt.Sprintf("SET GLOBAL %s;", strings.Join(queries, ", ")))
+	if err != nil {
+		log.Logger().Error("set global query_cache_size/query_cache_type variables failed", zap.NamedError("error", err))
+	}
+}
+
+func (s *Service) tuneZFS() {
+	if s.device.zfsVolume == nil {
+		// not on ZFS
+		return
+	}
+
+	globalVariables, err := s.db.GetGlobalVariables()
+	if err != nil {
+		log.Logger().Error("get global variables failed", zap.NamedError("error", err))
+		return
+	}
+
+	err = exec.Command("zfs", "set",
+		"atime=off",
+		"compression=lz4",
+		"logbias=throughput",
+		"primarycache=metadata",
+		fmt.Sprintf("recordsize=%d", globalVariables.InnodbPageSize),
+		*s.device.zfsVolume,
+	).Run()
+	if err != nil {
+		log.Logger().Error("set zfs variables failed", zap.NamedError("error", err))
+	}
+
+	// set global variables
+	// TODO: update non-dynamic variables
+	_, err = s.db.Exec(`
+SET GLOBAL
+	innodb_checksum_algorithm = 'none',
+	innodb_flush_neighbors = 0,
+	innodb_log_write_ahead_size = ?;
+`, globalVariables.InnodbPageSize)
+	if err != nil {
+		log.Logger().Error("set global variables failed", zap.NamedError("error", err))
+	}
+}
+
+func (s *Service) tuneOS() {
+	if !s.bold {
+		return
+	}
+
+	if s.storage == config.StorageSSD {
+		err := exec.Command("bash", "-c", fmt.Sprintf("echo none > /sys/block/%s/queue/scheduler", s.device.name)).Run()
+		if err != nil {
+			log.Logger().Error("set I/O scheduler to none failed", zap.NamedError("error", err))
+		}
+	}
+
+	err := s.tuneOSTuned()
+	if err != nil {
+		log.Logger().Error("tuning profile with tuned-adm failed", zap.NamedError("error", err))
+	}
+
+	err = exec.Command("bash", "-c", "echo never > /sys/kernel/mm/transparent_hugepage/enabled").Run()
+	if err != nil {
+		log.Logger().Error("disable transparent_hugepage failed", zap.NamedError("error", err))
+	}
+}
+
+func (s *Service) tuneOSTuned() error {
+	_, err := exec.LookPath("tuned-adm")
+	if err != nil {
+		execErr, ok := err.(*exec.Error)
+		if ok && execErr.Unwrap() == exec.ErrNotFound {
+			return nil
+		}
+
+		return err
+	}
+
+	// tuned-adm is enabled
+	output, err := exec.Command("tuned-adm", "active").Output()
+	if err != nil {
+		return fmt.Errorf("run tuned-adm active failed: %s", err.Error())
+	}
+
+	parts := strings.Fields(string(output))
+	if !strings.HasPrefix(string(output), "Current active profile:") || len(parts) < 4 {
+		return fmt.Errorf("tuned-adm active returns an unexpected output: %s", string(output))
+	}
+
+	var isOnCloud bool
+	for _, part := range parts[3:] {
+		if strings.HasPrefix(part, "oci-") {
+			isOnCloud = true
+			break
+		}
+	}
+
+	if isOnCloud {
+		return nil
+	}
+
+	output, err = exec.Command("tuned-adm", "list").Output()
+	if err != nil {
+		return fmt.Errorf("run tuned-adm list failed: %s", err.Error())
+	}
+
+	var profileExist bool
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "- throughput-performance") {
+			profileExist = true
+			break
+		}
+	}
+
+	if !profileExist {
+		return nil
+	}
+
+	err = exec.Command("tuned-adm", "profile", "throughput-performance").Run()
+	if err != nil {
+		return fmt.Errorf("run tuned-adm profile throughput-performance failed: %s", err.Error())
+	}
+
+	return nil
 }
 
 func hugePageAllocation() (uint64, error) {
