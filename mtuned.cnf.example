@@ -1,0 +1,99 @@
+# the username of the database user.
+username = mtuned
+
+# the password of the database user.
+password =
+
+# mysql socket location, mtuned will connect mysql
+# via socket if this set.
+socket = /var/lib/mysql/mysql.sock
+
+# ip or server name of the mysql server, mtuned will
+# connect mysql via tcp if this is set and socket is not set.
+hostname = localhost
+
+# config file where tuned parameters are saved persistently
+# to survive mysqld restarts
+persistent_tune = /etc/my.cnf.d/zz-tuned.cnf
+
+# whether to be bold and disable things that are counterproductive
+# in most cases but enabled by default
+bold = off
+
+# frequency of sending notifications
+# 0 - never
+# 1 - daily
+# 2 - immediately
+notify_frequency = 1
+
+# log file location
+log = /var/log/mtuned.log
+
+# log level
+# -1 - debug
+# 0  - info
+# 1  - warn
+# 2  - error
+# 3  - develop panic
+# 4  - panic
+# 5  - fatal
+log_level = 0
+
+# storage type
+# 0 - spinning rust
+# 1 - SSD
+# 2 - autodetect
+ssd = 2
+
+# this group is for configurating interval of parameters
+[interval]
+# tuning interval of parameter 'innodb_buffer_pool_size'
+innodb_buffer_pool_size = 60
+# tuning interval of parameter 'table_open_cache'
+table_open_cache = 60
+# tuning interval of parameter 'table_definition_cache'
+table_definition_cache = 60
+# tuning interval of parameter 'innodb_log_file_size'
+innodb_log_file_size = 60
+# tuning interval of parameter 'innodb_log_buffer_size'
+innodb_log_buffer_size = 60
+# tuning interval of parameter 'max_connections'
+max_connections = 60
+# tuning interval of parameter 'key_buffer_size'
+key_buffer_size = 60
+# tuning interval of parameter 'innodb_flush_neighbors'
+innodb_flush_neighbors = 60
+# tuning interval of parameter 'innodb_buffer_pool_instances'
+innodb_buffer_pool_instances = 60
+# tuning interval of parameter 'table_open_cache_instances'
+table_open_cache_instances = 60
+# tuning interval of parameter 'innodb_io_capacity_max'
+innodb_io_capacity_max = 60
+# tuning interval of parameter 'innodb_io_capacity'
+innodb_io_capacity = 60
+
+
+# this group is for configurating the notification channel,
+# there are 3 channels which can be configurated:
+# email, slack and webhook (priority as in this order)
+[notify]
+# email that notification sent to
+# email = email@example.com
+
+# smtp host
+# smtp_host = smtp.example.com
+
+# smtp port, default is 587
+# smtp_port = 587
+
+# sender email in smtp service
+# smtp_username =
+
+# sender email password in smtp service
+# smtp_password =
+
+# slack incoming message webhook
+# slack_webhook = https://hooks.slack.com/services/XXXXXX/XXXXXXXXXX/XXXXXXXXXXXXXXX
+
+# generic webhook
+# generic_webhook = https://webhook.example.com/notify

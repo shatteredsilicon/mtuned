@@ -1,0 +1,14 @@
+[Unit]
+Description=MySQL/MariaDB Tuning Daemon
+After=network.target
+
+[Service]
+User=mtuned
+Group=mtuned
+Type=simple
+Restart=on-failure
+RestartSec=10s
+ExecStart=/usr/sbin/mtuned --config=/etc/mtuned.cnf
+
+[Install]
+WantedBy=multi-user.target
