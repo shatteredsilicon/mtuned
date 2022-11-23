@@ -9,6 +9,17 @@ const (
 	DBNetTCP = "tcp"
 )
 
+const (
+	// StorageUnknown storage type - unknown
+	StorageUnknown = iota - 1
+	// StorageSpinning storage type - spinning rust
+	StorageSpinning
+	// StorageSSD storage type - ssd
+	StorageSSD
+	// StorageAutoDetect storage type - auto detect
+	StorageAutoDetect
+)
+
 // Parameter tuned parameters
 type Parameter struct {
 	InnodbBufPoolSize  uint `ini:"innodb_buffer_pool_size"`
