@@ -8,6 +8,8 @@ import (
 	"mtuned/pkg/config"
 	"mtuned/pkg/db"
 	"mtuned/pkg/log"
+	"mtuned/pkg/notify"
+	"mtuned/pkg/util"
 	"os/exec"
 	"regexp"
 	"sort"
@@ -57,6 +59,8 @@ type service struct {
 	device        device
 	bold          bool
 	db            *db.DB
+	notifySvc     *notify.Service
+	hpAlloc       uint64
 }
 
 type broadcastData struct {
@@ -70,7 +74,7 @@ type Service struct {
 }
 
 // NewService returns a new service of tuner
-func NewService(ctx context.Context, cfg *config.Config) (*Service, error) {
+func NewService(ctx context.Context, cfg *config.Config, notifySvc *notify.Service) (*Service, error) {
 	pool := db.NewDB()
 
 	var dataDir struct {
@@ -110,22 +114,24 @@ func NewService(ctx context.Context, cfg *config.Config) (*Service, error) {
 			device:      *dev,
 			bold:        cfg.Bold,
 			db:          pool,
+			notifySvc:   notifySvc,
+			hpAlloc:     hpAlloc,
 		},
 	}
 
 	svc.tuners = []Tuner{
-		NewMaxConnectionsTuner(ctx, pool, cfg.Interval.MaxConnections),
-		NewInnodbBufPoolSizeTuner(ctx, pool, cfg.Interval.InnodbBufPoolSize, hpAlloc),
-		NewTableOpenCacheTuner(ctx, pool, cfg.Interval.TableOpenCache),
-		NewKeyBufferSizeTuner(ctx, pool, cfg.Interval.KeyBufSize),
-		NewTableDefinitionCacheTuner(ctx, pool, cfg.Interval.TableDefCache),
-		NewInnodbFlushNeighborsTuner(ctx, pool, cfg.Interval.InnodbflushNBR, storage),
-		NewInnodbBufPoolInstsTuner(ctx, pool, cfg.Interval.InnodbBufPoolInst),
-		NewInnodbIOCapacityMaxTuner(ctx, pool, cfg.Interval.InnodbIOCapMax, svc.listenerRegister),
-		NewTableOpenCacheInstsTuner(ctx, pool, cfg.Interval.TableOpenCacheInst),
-		NewInnodbIOCapacityTuner(ctx, pool, cfg.Interval.InnodbIOCap),
-		NewInnodbLogBufferSizeTuner(ctx, pool, cfg.Interval.InnodbLogBufSize),
-		NewInnodbLogFileSizeTuner(ctx, pool, cfg.Interval.InnodbLogFileSize),
+		NewMaxConnectionsTuner(ctx, pool, cfg.Interval.MaxConnections, notifySvc),
+		NewInnodbBufPoolSizeTuner(ctx, pool, cfg.Interval.InnodbBufPoolSize, hpAlloc, notifySvc),
+		NewTableOpenCacheTuner(ctx, pool, cfg.Interval.TableOpenCache, notifySvc),
+		NewKeyBufferSizeTuner(ctx, pool, cfg.Interval.KeyBufSize, notifySvc),
+		NewTableDefinitionCacheTuner(ctx, pool, cfg.Interval.TableDefCache, notifySvc),
+		NewInnodbFlushNeighborsTuner(ctx, pool, cfg.Interval.InnodbflushNBR, storage, notifySvc),
+		NewInnodbBufPoolInstsTuner(ctx, pool, cfg.Interval.InnodbBufPoolInst, notifySvc),
+		NewInnodbIOCapacityMaxTuner(ctx, pool, cfg.Interval.InnodbIOCapMax, svc.listenerRegister, notifySvc),
+		NewTableOpenCacheInstsTuner(ctx, pool, cfg.Interval.TableOpenCacheInst, notifySvc),
+		NewInnodbIOCapacityTuner(ctx, pool, cfg.Interval.InnodbIOCap, notifySvc),
+		NewInnodbLogBufferSizeTuner(ctx, pool, cfg.Interval.InnodbLogBufSize, notifySvc),
+		NewInnodbLogFileSizeTuner(ctx, pool, cfg.Interval.InnodbLogFileSize, notifySvc),
 	}
 	svc.broadcastChan = make(chan broadcastData, len(svc.listenerMap))
 
@@ -152,7 +158,7 @@ func (s *Service) Run() {
 			return
 		}
 
-		go s.inferIOState()
+		s.inferIOState()
 	}
 }
 
@@ -406,11 +412,17 @@ func (s *Service) tuneQueryCache() {
 	}
 
 	var queries []string
+	var subjects []string
+	var contents []string
 	for _, row := range rows {
-		if row.Name == "query_cache_size" {
+		if row.Name == "query_cache_size" && row.Value != "0" {
 			queries = append(queries, "query_cache_size = 0")
-		} else if row.Name == "query_cache_type" {
+			subjects = append(subjects, fmt.Sprintf("%s changed", row.Name))
+			contents = append(contents, fmt.Sprintf("%s has been changed from %s to %s", row.Name, row.Value, "0"))
+		} else if row.Name == "query_cache_type" && row.Value != "0" {
 			queries = append(queries, "query_cache_type = 0")
+			subjects = append(subjects, fmt.Sprintf("%s changed", row.Name))
+			contents = append(contents, fmt.Sprintf("%s has been changed from %s to %s", row.Name, row.Value, "0"))
 		}
 	}
 	if len(queries) == 0 {
@@ -420,6 +432,15 @@ func (s *Service) tuneQueryCache() {
 	_, err = s.db.Exec(fmt.Sprintf("SET GLOBAL %s;", strings.Join(queries, ", ")))
 	if err != nil {
 		log.Logger().Error("set global query_cache_size/query_cache_type variables failed", zap.NamedError("error", err))
+	}
+
+	now := time.Now()
+	for i := range subjects {
+		s.notifySvc.Notify(notify.Message{
+			Subject: subjects[i],
+			Content: contents[i],
+			Time:    now,
+		})
 	}
 }
 
@@ -435,29 +456,102 @@ func (s *Service) tuneZFS() {
 		return
 	}
 
-	err = exec.Command("zfs", "set",
-		"atime=off",
-		"compression=lz4",
-		"logbias=throughput",
-		"primarycache=metadata",
-		fmt.Sprintf("recordsize=%d", globalVariables.InnodbPageSize),
+	propertyOutput, err := exec.Command("zfs", "get",
+		"atime,compression,logbias,primarycache,recordsize",
 		*s.device.zfsVolume,
-	).Run()
+	).Output()
 	if err != nil {
-		log.Logger().Error("set zfs variables failed", zap.NamedError("error", err))
+		log.Logger().Error("get zfs properties failed", zap.NamedError("error", err))
+		return
+	}
+
+	rows := strings.Split(string(propertyOutput), ",")
+	if len(rows) != 6 { // 1 head line and 5 row lines
+		log.Logger().Error("get unexpected amount of zfs properties", zap.ByteString("properties", propertyOutput))
+		return
+	}
+
+	expectedProperties := map[string]string{
+		"atime":        "off",
+		"compression":  "lz4",
+		"logbias":      "throughput",
+		"primarycache": "metadata",
+		"recordsize":   fmt.Sprintf("%d", globalVariables.InnodbPageSize),
+	}
+	notifyLines := []string{}
+	args := []string{}
+	for _, row := range rows[1:] {
+		fields := strings.Fields(string(row))
+		if len(fields) != 4 { //
+			log.Logger().Warn("get an unexpected line of zfs property output", zap.String("line", row))
+			continue
+		}
+
+		expected, ok := expectedProperties[fields[1]]
+		if !ok {
+			log.Logger().Warn("get an unexpected line of zfs property output", zap.String("line", row))
+			continue
+		}
+
+		if fields[2] == expected {
+			continue
+		}
+
+		args = append(args, fmt.Sprintf("%s=%s", fields[1], expected))
+		notifyLines = append(notifyLines, fmt.Sprintf("%s: %s -> %s", fields[1], fields[2], expected))
+	}
+
+	if len(args) > 1 {
+		err = exec.Command("zfs", append([]string{"set"}, append(args, s.device.name)...)...).Run()
+		if err != nil {
+			log.Logger().Error("set zfs properties failed", zap.NamedError("error", err))
+		} else {
+			s.notifySvc.Notify(notify.Message{
+				Subject: "zfs properties changed",
+				Content: fmt.Sprintf("Following zfs properties have been changed:\n%s", strings.Join(notifyLines, "\n")),
+				Time:    time.Now(),
+			})
+		}
+	}
+
+	queries := []string{}
+	notifyLines = []string{}
+	if globalVariables.InnodbChecksumAlgo != "none" {
+		queries = append(queries, fmt.Sprintf("innodb_checksum_algorithm='none'"))
+		notifyLines = append(notifyLines, fmt.Sprintf("innodb_checksum_algorithm: %s -> none", globalVariables.InnodbChecksumAlgo))
+	}
+	dbw := util.ParseBool(globalVariables.InnodbDoubleWrite)
+	if dbw == nil || *dbw {
+		notifyLines = append(notifyLines, "innodb_doublewrite: ON -> OFF")
+	}
+	if globalVariables.InnodbFlushNeighbors != 0 {
+		queries = append(queries, fmt.Sprintf("innodb_flush_neighbors=0"))
+		notifyLines = append(notifyLines, fmt.Sprintf("innodb_flush_neighbors: %d -> 0", globalVariables.InnodbFlushNeighbors))
+	}
+	if globalVariables.InnodbUseNativeAIO {
+		notifyLines = append(notifyLines, "innodb_use_native_aio: ON -> OFF")
+	}
+	if globalVariables.InnodbLogWriteAheadSize != uint64(globalVariables.InnodbPageSize) {
+		queries = append(queries, fmt.Sprintf("innodb_write_ahead_size=%d", globalVariables.InnodbPageSize))
+		notifyLines = append(notifyLines, fmt.Sprintf("innodb_doublewrite: %d -> %d", globalVariables.InnodbLogWriteAheadSize, globalVariables.InnodbPageSize))
+	}
+
+	if len(queries) == 0 {
+		return
 	}
 
 	// set global variables
 	// TODO: update non-dynamic variables
-	_, err = s.db.Exec(`
-SET GLOBAL
-	innodb_checksum_algorithm = 'none',
-	innodb_flush_neighbors = 0,
-	innodb_log_write_ahead_size = ?;
-`, globalVariables.InnodbPageSize)
+	_, err = s.db.Exec(fmt.Sprintf(`SET GLOBAL %s;`, strings.Join(queries, ", ")), globalVariables.InnodbPageSize)
 	if err != nil {
 		log.Logger().Error("set global variables failed", zap.NamedError("error", err))
 	}
+
+	s.notifySvc.Notify(notify.Message{
+		Subject: "MySQL/MariaDB global variables changed",
+		Content: fmt.Sprintf("Following global variables have been changed:\n%s", strings.Join(notifyLines, "\n")),
+		Time:    time.Now(),
+	})
 }
 
 func (s *Service) tuneOS() {
@@ -465,22 +559,66 @@ func (s *Service) tuneOS() {
 		return
 	}
 
-	if s.storage == config.StorageSSD {
-		err := exec.Command("bash", "-c", fmt.Sprintf("echo none > /sys/block/%s/queue/scheduler", s.device.name)).Run()
-		if err != nil {
-			log.Logger().Error("set I/O scheduler to none failed", zap.NamedError("error", err))
+	globalVariables, err := s.db.GetGlobalVariables()
+	if err != nil {
+		log.Logger().Error("get global variables from db failed", zap.NamedError("error", err))
+	} else {
+		if s.hpAlloc == 0 || !globalVariables.LargePages {
+			s.notifySvc.Notify(notify.Message{
+				Subject: "Huge Page Advice",
+				Content: "The lage pages feature is not fully configurated yet, it should be enabled by appropriate configuration at kernel level at boot time and in the database configuration.",
+				Time:    time.Now(),
+			})
 		}
 	}
 
-	err := s.tuneOSTuned()
+	if s.storage == config.StorageSSD {
+		filename := fmt.Sprintf("/sys/block/%s/queue/scheduler", s.device.name)
+		scheduler, err := exec.Command("grep", "-o", "\\[[a-zA-Z\\-_]*\\]", filename).Output()
+		if err != nil {
+			log.Logger().Error("read I/O scheduler failed", zap.NamedError("error", err))
+		}
+
+		if err == nil && string(scheduler) != "[none]" {
+			err = exec.Command("bash", "-c", fmt.Sprintf("echo none > %s", filename)).Run()
+			if err != nil {
+				log.Logger().Error("set I/O scheduler to [none] failed", zap.NamedError("error", err))
+			} else {
+				s.notifySvc.Notify(notify.Message{
+					Subject: "I/O scheduler changed",
+					Content: fmt.Sprintf("%s has been changed from %s to [never]", filename, scheduler),
+					Time:    time.Now(),
+				})
+			}
+		}
+	}
+
+	err = s.tuneOSTuned()
 	if err != nil {
 		log.Logger().Error("tuning profile with tuned-adm failed", zap.NamedError("error", err))
+	}
+
+	enabled, err := exec.Command("grep", "-o", "\\[[a-zA-Z\\-_]*\\]", "/sys/kernel/mm/transparent_hugepage/enabled").Output()
+	if err != nil {
+		log.Logger().Error("read I/O scheduler failed", zap.NamedError("error", err))
+		return
+	}
+
+	if strings.TrimSpace(string(enabled)) == "[never]" {
+		return
 	}
 
 	err = exec.Command("bash", "-c", "echo never > /sys/kernel/mm/transparent_hugepage/enabled").Run()
 	if err != nil {
 		log.Logger().Error("disable transparent_hugepage failed", zap.NamedError("error", err))
+		return
 	}
+
+	s.notifySvc.Notify(notify.Message{
+		Subject: "Transparent hugepage changed",
+		Content: fmt.Sprintf("/sys/kernel/mm/transparent_hugepage/enabled has been changed from %s to [never]", enabled),
+		Time:    time.Now(),
+	})
 }
 
 func (s *Service) tuneOSTuned() error {
@@ -539,6 +677,12 @@ func (s *Service) tuneOSTuned() error {
 	if err != nil {
 		return fmt.Errorf("run tuned-adm profile throughput-performance failed: %s", err.Error())
 	}
+
+	s.notifySvc.Notify(notify.Message{
+		Subject: "tuned-adm profile changed",
+		Content: "tuned-admin profile switched to throughput-performance",
+		Time:    time.Now(),
+	})
 
 	return nil
 }

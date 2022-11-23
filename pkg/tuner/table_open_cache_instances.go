@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"mtuned/pkg/db"
 	"mtuned/pkg/log"
+	"mtuned/pkg/notify"
 	"runtime"
 	"time"
 
@@ -20,11 +21,12 @@ const (
 
 // TableOpenCacheInstsTuner tuner for table_open_cache_instances parameter
 type TableOpenCacheInstsTuner struct {
-	name     string
-	interval uint
-	ctx      context.Context
-	value    *uint64
-	db       *db.DB
+	name      string
+	interval  uint
+	ctx       context.Context
+	value     *uint64
+	db        *db.DB
+	notifySvc *notify.Service
 }
 
 // NewTableOpenCacheInstsTuner returns an instance of TableOpenCacheInstsTuner
@@ -32,16 +34,18 @@ func NewTableOpenCacheInstsTuner(
 	ctx context.Context,
 	db *db.DB,
 	interval uint,
+	notifySvc *notify.Service,
 ) *TableOpenCacheInstsTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
 	}
 
 	return &TableOpenCacheInstsTuner{
-		name:     "table_open_cache_instances",
-		interval: interval,
-		ctx:      ctx,
-		db:       db,
+		name:      "table_open_cache_instances",
+		interval:  interval,
+		ctx:       ctx,
+		db:        db,
+		notifySvc: notifySvc,
 	}
 }
 
@@ -74,7 +78,14 @@ func (t *TableOpenCacheInstsTuner) Run() {
 			size = MinTableOpenCacheInsts
 		}
 
-		if globalVariables.TableOpenCacheInsts == size || (t.value != nil && *t.value == size) {
+		var cacheInsts uint64
+		if t.value != nil && *t.value != 0 {
+			cacheInsts = *t.value
+		} else {
+			cacheInsts = globalVariables.TableOpenCacheInsts
+		}
+
+		if cacheInsts == size {
 			log.Logger().Debug(fmt.Sprintf("%s tuner continued", t.name),
 				zap.Uint64("globalVariables.TableOpenCacheInsts", globalVariables.TableOpenCacheInsts),
 				zap.Uint64p("t.value", t.value))
@@ -82,5 +93,11 @@ func (t *TableOpenCacheInstsTuner) Run() {
 		}
 
 		t.value = &size
+		now := time.Now()
+		t.notifySvc.Notify(notify.Message{
+			Subject: fmt.Sprintf("%s changed", t.name),
+			Content: fmt.Sprintf("%s has been changed from %d to %d at %s", t.name, cacheInsts, size, now.String()),
+			Time:    now,
+		})
 	}
 }

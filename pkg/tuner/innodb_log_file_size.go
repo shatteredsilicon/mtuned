@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"mtuned/pkg/db"
 	"mtuned/pkg/log"
+	"mtuned/pkg/notify"
 	"mtuned/pkg/util"
 	"time"
 
@@ -20,11 +21,12 @@ const (
 
 // InnodbLogFileSizeTuner tuner for innodb_log_file_size param
 type InnodbLogFileSizeTuner struct {
-	name     string
-	interval uint
-	ctx      context.Context
-	db       *db.DB
-	value    *uint64
+	name      string
+	interval  uint
+	ctx       context.Context
+	db        *db.DB
+	value     *uint64
+	notifySvc *notify.Service
 }
 
 // NewInnodbLogFileSizeTuner returns an instance of InnodbLogFileSizeTuner
@@ -32,16 +34,18 @@ func NewInnodbLogFileSizeTuner(
 	ctx context.Context,
 	db *db.DB,
 	interval uint,
+	notifySvc *notify.Service,
 ) *InnodbLogFileSizeTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
 	}
 
 	tuner := &InnodbLogFileSizeTuner{
-		name:     "innodb_log_file_size",
-		interval: interval,
-		ctx:      ctx,
-		db:       db,
+		name:      "innodb_log_file_size",
+		interval:  interval,
+		ctx:       ctx,
+		db:        db,
+		notifySvc: notifySvc,
 	}
 	return tuner
 }
@@ -98,5 +102,11 @@ func (t *InnodbLogFileSizeTuner) Run() {
 		}
 
 		t.value = &value
+		now := time.Now()
+		t.notifySvc.Notify(notify.Message{
+			Subject: fmt.Sprintf("%s changed", t.name),
+			Content: fmt.Sprintf("%s has been changed from %d to %d at %s", t.name, fileSize, value, now.String()),
+			Time:    now,
+		})
 	}
 }

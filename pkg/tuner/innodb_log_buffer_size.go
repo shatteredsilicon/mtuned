@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"mtuned/pkg/db"
 	"mtuned/pkg/log"
+	"mtuned/pkg/notify"
 	"mtuned/pkg/util"
 	"time"
 
@@ -20,10 +21,11 @@ const (
 
 // InnodbLogBufferSizeTuner tuner for innodb_log_buffer_size param
 type InnodbLogBufferSizeTuner struct {
-	name     string
-	interval uint
-	ctx      context.Context
-	db       *db.DB
+	name      string
+	interval  uint
+	ctx       context.Context
+	db        *db.DB
+	notifySvc *notify.Service
 }
 
 // NewInnodbLogBufferSizeTuner returns an instance of InnodbLogBufferSizeTuner
@@ -31,16 +33,18 @@ func NewInnodbLogBufferSizeTuner(
 	ctx context.Context,
 	db *db.DB,
 	interval uint,
+	notifySvc *notify.Service,
 ) *InnodbLogBufferSizeTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
 	}
 
 	tuner := &InnodbLogBufferSizeTuner{
-		name:     "innodb_log_buffer_size",
-		interval: interval,
-		ctx:      ctx,
-		db:       db,
+		name:      "innodb_log_buffer_size",
+		interval:  interval,
+		ctx:       ctx,
+		db:        db,
+		notifySvc: notifySvc,
 	}
 	return tuner
 }
@@ -93,5 +97,12 @@ func (t *InnodbLogBufferSizeTuner) Run() {
 			log.Logger().Error("set innodb_log_buffer_size failed", zap.String("tuner", t.name), zap.NamedError("error", err), zap.Uint64("value", value))
 			continue
 		}
+
+		now := time.Now()
+		t.notifySvc.Notify(notify.Message{
+			Subject: fmt.Sprintf("%s changed", t.name),
+			Content: fmt.Sprintf("%s has been changed from %d to %d at %s", t.name, globalVariables.InnodbLogBufferSize, value, now.String()),
+			Time:    now,
+		})
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"mtuned/pkg/db"
 	"mtuned/pkg/log"
+	"mtuned/pkg/notify"
 	"mtuned/pkg/util"
 	"strconv"
 	"time"
@@ -14,10 +15,11 @@ import (
 
 // TableOpenCacheTuner tuner for table_open_cache parameter
 type TableOpenCacheTuner struct {
-	name     string
-	interval uint
-	ctx      context.Context
-	db       *db.DB
+	name      string
+	interval  uint
+	ctx       context.Context
+	db        *db.DB
+	notifySvc *notify.Service
 }
 
 // NewTableOpenCacheTuner returns an instance of NewTableOpenCacheTuner
@@ -25,16 +27,18 @@ func NewTableOpenCacheTuner(
 	ctx context.Context,
 	db *db.DB,
 	interval uint,
+	notifySvc *notify.Service,
 ) *TableOpenCacheTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
 	}
 
 	return &TableOpenCacheTuner{
-		name:     "table_open_cache",
-		interval: interval,
-		ctx:      ctx,
-		db:       db,
+		name:      "table_open_cache",
+		interval:  interval,
+		ctx:       ctx,
+		db:        db,
+		notifySvc: notifySvc,
 	}
 }
 
@@ -81,10 +85,21 @@ func (t *TableOpenCacheTuner) Run() {
 		}
 
 		tableOpenCache := util.NextUint64Multiple(globalVariables.TableOpenCache, globalVariables.TableOpenCacheInsts)
+		if tableOpenCache == globalVariables.TableOpenCache {
+			continue
+		}
+
 		_, err = t.db.Exec("SET GLOBAL table_open_cache = ?", tableOpenCache)
 		if err != nil {
 			log.Logger().Error("set table_open_cache failed", zap.String("tuner", t.name), zap.NamedError("error", err), zap.Uint64("value", tableOpenCache))
 			continue
 		}
+
+		now := time.Now()
+		t.notifySvc.Notify(notify.Message{
+			Subject: fmt.Sprintf("%s changed", t.name),
+			Content: fmt.Sprintf("%s has been changed from %d to %d at %s", t.name, globalVariables.TableOpenCache, tableOpenCache, now.String()),
+			Time:    now,
+		})
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"mtuned/pkg/db"
 	"mtuned/pkg/log"
+	"mtuned/pkg/notify"
 	"mtuned/pkg/util"
 	"time"
 
@@ -23,6 +24,7 @@ type MaxConnectionsTuner struct {
 	ctx            context.Context
 	lastUpdateTime time.Time
 	db             *db.DB
+	notifySvc      *notify.Service
 }
 
 // NewMaxConnectionsTuner returns an instance of MaxConnectionsTuner
@@ -30,6 +32,7 @@ func NewMaxConnectionsTuner(
 	ctx context.Context,
 	db *db.DB,
 	interval uint,
+	notifySvc *notify.Service,
 ) *MaxConnectionsTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
@@ -41,6 +44,7 @@ func NewMaxConnectionsTuner(
 		ctx:            ctx,
 		db:             db,
 		lastUpdateTime: time.Now(),
+		notifySvc:      notifySvc,
 	}
 	return tuner
 }
@@ -79,12 +83,22 @@ func (t *MaxConnectionsTuner) Run() {
 		if value > MaxMaxConnections {
 			value = MaxMaxConnections
 		}
+		if globalVariables.MaxConnections == value {
+			continue
+		}
+
 		_, err = t.db.Exec("SET GLOBAL max_connections = ?", value)
 		if err != nil {
 			log.Logger().Error("set max_connections failed", zap.String("tuner", t.name), zap.NamedError("error", err), zap.Uint64("value", value))
 			continue
 		}
 
-		t.lastUpdateTime = time.Now()
+		now := time.Now()
+		t.lastUpdateTime = now
+		t.notifySvc.Notify(notify.Message{
+			Subject: fmt.Sprintf("%s changed", t.name),
+			Content: fmt.Sprintf("%s has been changed from %d to %d at %s", t.name, globalVariables.MaxConnections, value, now.String()),
+			Time:    now,
+		})
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"mtuned/pkg/db"
 	"mtuned/pkg/log"
+	"mtuned/pkg/notify"
 	"runtime"
 	"time"
 
@@ -18,11 +19,12 @@ const (
 
 // InnodbBufPoolInstsTuner tuner for innodb_buffer_pool_instances parameter
 type InnodbBufPoolInstsTuner struct {
-	name     string
-	interval uint
-	ctx      context.Context
-	value    *uint64
-	db       *db.DB
+	name      string
+	interval  uint
+	ctx       context.Context
+	value     *uint64
+	db        *db.DB
+	notifySvc *notify.Service
 }
 
 // NewInnodbBufPoolInstsTuner returns an instance of InnodbBufPoolInstsTuner
@@ -30,16 +32,18 @@ func NewInnodbBufPoolInstsTuner(
 	ctx context.Context,
 	db *db.DB,
 	interval uint,
+	notifySvc *notify.Service,
 ) *InnodbBufPoolInstsTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
 	}
 
 	return &InnodbBufPoolInstsTuner{
-		name:     "innodb_buffer_pool_instances",
-		interval: interval,
-		ctx:      ctx,
-		db:       db,
+		name:      "innodb_buffer_pool_instances",
+		interval:  interval,
+		ctx:       ctx,
+		db:        db,
+		notifySvc: notifySvc,
 	}
 }
 
@@ -70,7 +74,14 @@ func (t *InnodbBufPoolInstsTuner) Run() {
 			size = MaxInnodbBufPoolInsts
 		}
 
-		if globalVariables.InnodbBufPoolInsts == size || (t.value != nil && *t.value == size) {
+		var poolInsts uint64
+		if t.value != nil && *t.value != 0 {
+			poolInsts = *t.value
+		} else {
+			poolInsts = globalVariables.InnodbBufPoolInsts
+		}
+
+		if poolInsts == size {
 			log.Logger().Debug(fmt.Sprintf("%s tuner continued", t.name),
 				zap.Uint64("globalVariables.InnodbBufPoolInsts", globalVariables.InnodbBufPoolInsts),
 				zap.Uint64("size", size), zap.Uint64p("t.value", t.value))
@@ -78,5 +89,11 @@ func (t *InnodbBufPoolInstsTuner) Run() {
 		}
 
 		t.value = &size
+		now := time.Now()
+		t.notifySvc.Notify(notify.Message{
+			Subject: fmt.Sprintf("%s changed", t.name),
+			Content: fmt.Sprintf("%s has been changed from %d to %d at %s", t.name, poolInsts, size, now.String()),
+			Time:    now,
+		})
 	}
 }

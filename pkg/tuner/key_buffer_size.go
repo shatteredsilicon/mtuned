@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"mtuned/pkg/db"
 	"mtuned/pkg/log"
+	"mtuned/pkg/notify"
 	"mtuned/pkg/util"
 	"time"
 
@@ -19,10 +20,11 @@ const (
 
 // KeyBufferSizeTuner tuner for key_buffer_size parameter
 type KeyBufferSizeTuner struct {
-	name     string
-	interval uint
-	ctx      context.Context
-	db       *db.DB
+	name      string
+	interval  uint
+	ctx       context.Context
+	db        *db.DB
+	notifySvc *notify.Service
 }
 
 // NewKeyBufferSizeTuner returns an instance of KeyBufferSizeTuner
@@ -30,16 +32,18 @@ func NewKeyBufferSizeTuner(
 	ctx context.Context,
 	db *db.DB,
 	interval uint,
+	notifySvc *notify.Service,
 ) *KeyBufferSizeTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
 	}
 
 	return &KeyBufferSizeTuner{
-		name:     "key_buffer_size",
-		interval: interval,
-		ctx:      ctx,
-		db:       db,
+		name:      "key_buffer_size",
+		interval:  interval,
+		ctx:       ctx,
+		db:        db,
+		notifySvc: notifySvc,
 	}
 }
 
@@ -84,10 +88,21 @@ func (t *KeyBufferSizeTuner) Run() {
 		}
 
 		keyBufferSize := util.NextUint64Multiple(globalVariables.TableOpenCache, KeyBufferUnitSize)
+		if keyBufferSize == globalVariables.KeyBufSize {
+			continue
+		}
+
 		_, err = t.db.Exec("SET GLOBAL key_buffer_size = ?", keyBufferSize)
 		if err != nil {
 			log.Logger().Error("sets key_buffer_size failed", zap.String("tuner", t.name), zap.NamedError("error", err), zap.Uint64("value", keyBufferSize))
 			continue
 		}
+
+		now := time.Now()
+		t.notifySvc.Notify(notify.Message{
+			Subject: fmt.Sprintf("%s changed", t.name),
+			Content: fmt.Sprintf("%s has been changed from %d to %d at %s", t.name, globalVariables.KeyBufSize, keyBufferSize, now.String()),
+			Time:    now,
+		})
 	}
 }

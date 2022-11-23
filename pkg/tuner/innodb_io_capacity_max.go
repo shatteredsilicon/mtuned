@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"mtuned/pkg/db"
 	"mtuned/pkg/log"
+	"mtuned/pkg/notify"
 	"time"
 	"unsafe"
 
@@ -24,6 +25,7 @@ type InnodbIOCapacityMaxTuner struct {
 	db            *db.DB
 	ioState       ioState
 	broadcastChan func(unsafe.Pointer) <-chan broadcastData
+	notifySvc     *notify.Service
 }
 
 // NewInnodbIOCapacityMaxTuner returns an instance of InnodbIOCapacityMaxTuner
@@ -32,16 +34,18 @@ func NewInnodbIOCapacityMaxTuner(
 	db *db.DB,
 	interval uint,
 	listenerRegister func(unsafe.Pointer) func(unsafe.Pointer) <-chan broadcastData,
+	notifySvc *notify.Service,
 ) *InnodbIOCapacityMaxTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
 	}
 
 	tuner := &InnodbIOCapacityMaxTuner{
-		name:     "innodb_io_capacity_max",
-		interval: interval,
-		ctx:      ctx,
-		db:       db,
+		name:      "innodb_io_capacity_max",
+		interval:  interval,
+		ctx:       ctx,
+		db:        db,
+		notifySvc: notifySvc,
 	}
 	tuner.broadcastChan = listenerRegister(unsafe.Pointer(tuner))
 	return tuner
@@ -80,15 +84,32 @@ func (t *InnodbIOCapacityMaxTuner) Run() {
 			continue
 		}
 
+		globalVariables, err := t.db.GetGlobalVariables()
+		if err != nil {
+			log.Logger().Error("get global variables failed", zap.String("tuner", t.name), zap.NamedError("error", err))
+			continue
+		}
+
 		value := uint64(t.ioState.maxIOSpeed * 0.75)
 		if value < MinInnodbIOCapacityMax {
 			value = MinInnodbIOCapacityMax
 		}
 
-		_, err := t.db.Exec("SET GLOBAL innodb_io_capacity_max = ?", value)
-		if err != nil {
-			log.Logger().Error("set innodb_flush_neighbors failed", zap.String("tuner", t.name), zap.NamedError("error", err), zap.Uint64("value", value))
+		if globalVariables.InnodbIOCapacityMax == value {
 			continue
 		}
+
+		_, err = t.db.Exec("SET GLOBAL innodb_io_capacity_max = ?", value)
+		if err != nil {
+			log.Logger().Error("set innodb_io_capacity_max failed", zap.String("tuner", t.name), zap.NamedError("error", err), zap.Uint64("value", value))
+			continue
+		}
+
+		now := time.Now()
+		t.notifySvc.Notify(notify.Message{
+			Subject: fmt.Sprintf("%s changed", t.name),
+			Content: fmt.Sprintf("%s has been changed from %d to %d at %s", t.name, globalVariables.InnodbIOCapacityMax, value, now.String()),
+			Time:    now,
+		})
 	}
 }

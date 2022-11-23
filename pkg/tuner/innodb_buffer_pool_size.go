@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"mtuned/pkg/db"
 	"mtuned/pkg/log"
+	"mtuned/pkg/notify"
 	"mtuned/pkg/util"
 	"syscall"
 	"time"
@@ -19,6 +20,7 @@ type InnodbBufPoolSizeTuner struct {
 	ctx           context.Context
 	db            *db.DB
 	hugePageAlloc uint64
+	notifySvc     *notify.Service
 }
 
 // NewInnodbBufPoolSizeTuner returns an instance of InnodbBufPoolSizeTuner
@@ -27,6 +29,7 @@ func NewInnodbBufPoolSizeTuner(
 	db *db.DB,
 	interval uint,
 	hugePageAlloc uint64,
+	notifySvc *notify.Service,
 ) *InnodbBufPoolSizeTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
@@ -38,6 +41,7 @@ func NewInnodbBufPoolSizeTuner(
 		ctx:           ctx,
 		db:            db,
 		hugePageAlloc: hugePageAlloc,
+		notifySvc:     notifySvc,
 	}
 }
 
@@ -89,10 +93,21 @@ func (t *InnodbBufPoolSizeTuner) Run() {
 
 		size = util.NextUint64Multiple(size,
 			globalVariables.InnodbBufPoolInsts*globalVariables.InnodbBufPoolChunkSize)
+		if size == globalVariables.InnodbBufferPoolSize {
+			continue
+		}
+
 		_, err = t.db.Exec("SET GLOBAL innodb_buffer_pool_size = ?", size)
 		if err != nil {
 			log.Logger().Error("set innodb_buffer_pool_size failed", zap.String("tuner", t.name), zap.NamedError("error", err), zap.Uint64("value", size))
 			continue
 		}
+
+		now := time.Now()
+		t.notifySvc.Notify(notify.Message{
+			Subject: fmt.Sprintf("%s changed", t.name),
+			Content: fmt.Sprintf("%s has been changed from %d to %d at %s", t.name, globalVariables.InnodbBufferPoolSize, size, now.String()),
+			Time:    now,
+		})
 	}
 }

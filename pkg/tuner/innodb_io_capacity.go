@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"mtuned/pkg/db"
 	"mtuned/pkg/log"
+	"mtuned/pkg/notify"
 	"time"
 
 	"go.uber.org/zap"
@@ -17,10 +18,11 @@ const (
 
 // InnodbIOCapacityTuner tuner for innodb_io_capacity param
 type InnodbIOCapacityTuner struct {
-	name     string
-	interval uint
-	ctx      context.Context
-	db       *db.DB
+	name      string
+	interval  uint
+	ctx       context.Context
+	db        *db.DB
+	notifySvc *notify.Service
 }
 
 // NewInnodbIOCapacityTuner returns an instance of InnodbIOCapacityTuner
@@ -28,16 +30,18 @@ func NewInnodbIOCapacityTuner(
 	ctx context.Context,
 	db *db.DB,
 	interval uint,
+	notifySvc *notify.Service,
 ) *InnodbIOCapacityTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
 	}
 
 	tuner := &InnodbIOCapacityTuner{
-		name:     "innodb_io_capacity",
-		interval: interval,
-		ctx:      ctx,
-		db:       db,
+		name:      "innodb_io_capacity",
+		interval:  interval,
+		ctx:       ctx,
+		db:        db,
+		notifySvc: notifySvc,
 	}
 	return tuner
 }
@@ -75,10 +79,21 @@ func (t *InnodbIOCapacityTuner) Run() {
 		if value < MinInnodbIOCapacity {
 			value = MinInnodbIOCapacity
 		}
+		if globalVariables.InnodbIOCapacity == value {
+			continue
+		}
+
 		_, err = t.db.Exec("SET GLOBAL innodb_io_capacity = ?", value)
 		if err != nil {
 			log.Logger().Error("set innodb_io_capacity failed", zap.String("tuner", t.name), zap.NamedError("error", err), zap.Uint64("value", value))
 			continue
 		}
+
+		now := time.Now()
+		t.notifySvc.Notify(notify.Message{
+			Subject: fmt.Sprintf("%s changed", t.name),
+			Content: fmt.Sprintf("%s has been changed from %d to %d at %s", t.name, globalVariables.InnodbIOCapacity, value, now.String()),
+			Time:    now,
+		})
 	}
 }

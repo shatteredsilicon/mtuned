@@ -9,8 +9,11 @@ import (
 	"mtuned/pkg/config"
 	"mtuned/pkg/db"
 	logPkg "mtuned/pkg/log"
+	"mtuned/pkg/notify"
 	"mtuned/pkg/tuner"
 	"mtuned/pkg/util"
+
+	"go.uber.org/zap"
 )
 
 var (
@@ -44,9 +47,47 @@ func main() {
 	}
 	defer logPkg.Sync()
 
-	tunerSvc, err := tuner.NewService(context.Background(), cfg)
+	notifySvc := notify.NewService(cfg)
+	notifyChan := make(chan interface{})
+	runNotify := func() {
+		defer func() {
+			r := recover()
+			if r != nil {
+				logPkg.Logger().Error("notify service crashed", zap.Any("recover", r))
+			}
+
+			notifyChan <- r
+		}()
+
+		notifySvc.Run()
+	}
+	go runNotify()
+
+	tunerSvc, err := tuner.NewService(context.Background(), cfg, notifySvc)
 	if err != nil {
 		log.Panic(err)
 	}
-	tunerSvc.Run()
+	tunerChan := make(chan interface{})
+	runTuner := func() {
+		defer func() {
+			r := recover()
+			if r != nil {
+				logPkg.Logger().Error("tuner service crashed", zap.Any("recover", r))
+			}
+
+			tunerChan <- r
+		}()
+
+		tunerSvc.Run()
+	}
+	go runTuner()
+
+	for {
+		select {
+		case <-notifyChan:
+			go runNotify()
+		case <-tunerChan:
+			go runTuner()
+		}
+	}
 }
