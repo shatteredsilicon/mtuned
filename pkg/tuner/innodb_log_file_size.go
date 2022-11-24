@@ -7,6 +7,7 @@ import (
 	"mtuned/pkg/log"
 	"mtuned/pkg/notify"
 	"mtuned/pkg/util"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -21,12 +22,13 @@ const (
 
 // InnodbLogFileSizeTuner tuner for innodb_log_file_size param
 type InnodbLogFileSizeTuner struct {
-	name      string
-	interval  uint
-	ctx       context.Context
-	db        *db.DB
-	value     *uint64
-	notifySvc *notify.Service
+	name        string
+	interval    uint
+	ctx         context.Context
+	db          *db.DB
+	value       *uint64
+	notifySvc   *notify.Service
+	sendMessage func(Message)
 }
 
 // NewInnodbLogFileSizeTuner returns an instance of InnodbLogFileSizeTuner
@@ -35,17 +37,19 @@ func NewInnodbLogFileSizeTuner(
 	db *db.DB,
 	interval uint,
 	notifySvc *notify.Service,
+	sendMessage func(Message),
 ) *InnodbLogFileSizeTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
 	}
 
 	tuner := &InnodbLogFileSizeTuner{
-		name:      "innodb_log_file_size",
-		interval:  interval,
-		ctx:       ctx,
-		db:        db,
-		notifySvc: notifySvc,
+		name:        "innodb_log_file_size",
+		interval:    interval,
+		ctx:         ctx,
+		db:          db,
+		notifySvc:   notifySvc,
+		sendMessage: sendMessage,
 	}
 	return tuner
 }
@@ -100,6 +104,12 @@ func (t *InnodbLogFileSizeTuner) Run() {
 		} else if value > fileSize*globalVariables.InnodbLogFilesInGroup {
 			value = MaxInnodbLogFileTotalSize / globalVariables.InnodbLogFilesInGroup
 		}
+
+		t.sendMessage(Message{
+			Section: "mysqld",
+			Key:     strings.ReplaceAll(t.name, "_", "-"),
+			Value:   fmt.Sprintf("%d", value),
+		})
 
 		t.value = &value
 		now := time.Now()

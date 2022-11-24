@@ -22,13 +22,12 @@ type Config struct {
 
 // Load loads configuration from path
 func Load(path string) (*Config, error) {
-	cfg, err := ini.Load(path)
+	f, err := ini.Load(path)
 	if err != nil {
 		return nil, err
 	}
 
-	var c Config
-	err = cfg.MapTo(&c)
-
-	return &c, err
+	var cfg Config
+	err = f.MapTo(&cfg)
+	return &cfg, err
 }

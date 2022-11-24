@@ -8,6 +8,7 @@ import (
 	"mtuned/pkg/notify"
 	"mtuned/pkg/util"
 	"strconv"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -15,11 +16,12 @@ import (
 
 // TableOpenCacheTuner tuner for table_open_cache parameter
 type TableOpenCacheTuner struct {
-	name      string
-	interval  uint
-	ctx       context.Context
-	db        *db.DB
-	notifySvc *notify.Service
+	name        string
+	interval    uint
+	ctx         context.Context
+	db          *db.DB
+	notifySvc   *notify.Service
+	sendMessage func(Message)
 }
 
 // NewTableOpenCacheTuner returns an instance of NewTableOpenCacheTuner
@@ -28,17 +30,19 @@ func NewTableOpenCacheTuner(
 	db *db.DB,
 	interval uint,
 	notifySvc *notify.Service,
+	sendMessage func(Message),
 ) *TableOpenCacheTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
 	}
 
 	return &TableOpenCacheTuner{
-		name:      "table_open_cache",
-		interval:  interval,
-		ctx:       ctx,
-		db:        db,
-		notifySvc: notifySvc,
+		name:        "table_open_cache",
+		interval:    interval,
+		ctx:         ctx,
+		db:          db,
+		notifySvc:   notifySvc,
+		sendMessage: sendMessage,
 	}
 }
 
@@ -86,8 +90,17 @@ func (t *TableOpenCacheTuner) Run() {
 
 		tableOpenCache := util.NextUint64Multiple(globalVariables.TableOpenCache, globalVariables.TableOpenCacheInsts)
 		if tableOpenCache == globalVariables.TableOpenCache {
+			log.Logger().Debug(fmt.Sprintf("%s tuner continued", t.name),
+				zap.Uint64("globalVariables.TableOpenCache", globalVariables.TableOpenCache),
+				zap.Uint64("tableOpenCache", tableOpenCache))
 			continue
 		}
+
+		t.sendMessage(Message{
+			Section: "mysqld",
+			Key:     strings.ReplaceAll(t.name, "_", "-"),
+			Value:   fmt.Sprintf("%d", tableOpenCache),
+		})
 
 		_, err = t.db.Exec("SET GLOBAL table_open_cache = ?", tableOpenCache)
 		if err != nil {

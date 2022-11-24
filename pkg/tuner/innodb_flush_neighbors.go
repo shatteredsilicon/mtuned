@@ -7,6 +7,7 @@ import (
 	"mtuned/pkg/db"
 	"mtuned/pkg/log"
 	"mtuned/pkg/notify"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -22,6 +23,7 @@ type InnodbFlushNeighborsTuner struct {
 	broadcastChan func(unsafe.Pointer) <-chan broadcastData
 	storage       int8
 	notifySvc     *notify.Service
+	sendMessage   func(Message)
 }
 
 // NewInnodbFlushNeighborsTuner returns an instance of InnodbFlushNeighborsTuner
@@ -31,18 +33,20 @@ func NewInnodbFlushNeighborsTuner(
 	interval uint,
 	storage int8,
 	notifySvc *notify.Service,
+	sendMessage func(Message),
 ) *InnodbFlushNeighborsTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
 	}
 
 	tuner := &InnodbFlushNeighborsTuner{
-		name:      "innodb_flush_neighbors",
-		interval:  interval,
-		ctx:       ctx,
-		db:        db,
-		storage:   storage,
-		notifySvc: notifySvc,
+		name:        "innodb_flush_neighbors",
+		interval:    interval,
+		ctx:         ctx,
+		db:          db,
+		storage:     storage,
+		notifySvc:   notifySvc,
+		sendMessage: sendMessage,
 	}
 	return tuner
 }
@@ -77,8 +81,16 @@ func (t *InnodbFlushNeighborsTuner) Run() {
 		}
 
 		if globalVariables.InnodbFlushNeighbors == 0 {
+			log.Logger().Debug(fmt.Sprintf("%s tuner continued", t.name),
+				zap.Uint8("globalVariables.InnodbFlushNeighbors", globalVariables.InnodbFlushNeighbors))
 			continue
 		}
+
+		t.sendMessage(Message{
+			Section: "mysqld",
+			Key:     strings.ReplaceAll(t.name, "_", "-"),
+			Value:   "0",
+		})
 
 		_, err = t.db.Exec("SET GLOBAL innodb_flush_neighbors = ?", 0)
 		if err != nil {

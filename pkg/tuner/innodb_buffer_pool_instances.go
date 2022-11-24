@@ -6,7 +6,9 @@ import (
 	"mtuned/pkg/db"
 	"mtuned/pkg/log"
 	"mtuned/pkg/notify"
+	"mtuned/pkg/util"
 	"runtime"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -19,12 +21,13 @@ const (
 
 // InnodbBufPoolInstsTuner tuner for innodb_buffer_pool_instances parameter
 type InnodbBufPoolInstsTuner struct {
-	name      string
-	interval  uint
-	ctx       context.Context
-	value     *uint64
-	db        *db.DB
-	notifySvc *notify.Service
+	name        string
+	interval    uint
+	ctx         context.Context
+	value       *uint64
+	db          *db.DB
+	notifySvc   *notify.Service
+	sendMessage func(Message)
 }
 
 // NewInnodbBufPoolInstsTuner returns an instance of InnodbBufPoolInstsTuner
@@ -33,17 +36,19 @@ func NewInnodbBufPoolInstsTuner(
 	db *db.DB,
 	interval uint,
 	notifySvc *notify.Service,
+	sendMessage func(Message),
 ) *InnodbBufPoolInstsTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
 	}
 
 	return &InnodbBufPoolInstsTuner{
-		name:      "innodb_buffer_pool_instances",
-		interval:  interval,
-		ctx:       ctx,
-		db:        db,
-		notifySvc: notifySvc,
+		name:        "innodb_buffer_pool_instances",
+		interval:    interval,
+		ctx:         ctx,
+		db:          db,
+		notifySvc:   notifySvc,
+		sendMessage: sendMessage,
 	}
 }
 
@@ -69,6 +74,15 @@ func (t *InnodbBufPoolInstsTuner) Run() {
 			continue
 		}
 
+		// Innodb will adjust the value to 1 automatically
+		// if buffer pool size is smaller than 1GB
+		if globalVariables.InnodbBufferPoolSize < util.GB {
+			log.Logger().Debug(fmt.Sprintf("%s tuner continued", t.name),
+				zap.Uint64("globalVariables.InnodbBufferPoolSize", globalVariables.InnodbBufferPoolSize),
+				zap.Uint64("util.GB", util.GB))
+			continue
+		}
+
 		size := uint64(runtime.NumCPU())
 		if size > MaxInnodbBufPoolInsts {
 			size = MaxInnodbBufPoolInsts
@@ -87,6 +101,12 @@ func (t *InnodbBufPoolInstsTuner) Run() {
 				zap.Uint64("size", size), zap.Uint64p("t.value", t.value))
 			continue
 		}
+
+		t.sendMessage(Message{
+			Section: "mysqld",
+			Key:     strings.ReplaceAll(t.name, "_", "-"),
+			Value:   fmt.Sprintf("%d", size),
+		})
 
 		t.value = &size
 		now := time.Now()

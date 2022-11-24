@@ -7,6 +7,7 @@ import (
 	"mtuned/pkg/log"
 	"mtuned/pkg/notify"
 	"mtuned/pkg/util"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -25,6 +26,7 @@ type MaxConnectionsTuner struct {
 	lastUpdateTime time.Time
 	db             *db.DB
 	notifySvc      *notify.Service
+	sendMessage    func(Message)
 }
 
 // NewMaxConnectionsTuner returns an instance of MaxConnectionsTuner
@@ -33,6 +35,7 @@ func NewMaxConnectionsTuner(
 	db *db.DB,
 	interval uint,
 	notifySvc *notify.Service,
+	sendMessage func(Message),
 ) *MaxConnectionsTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
@@ -45,6 +48,7 @@ func NewMaxConnectionsTuner(
 		db:             db,
 		lastUpdateTime: time.Now(),
 		notifySvc:      notifySvc,
+		sendMessage:    sendMessage,
 	}
 	return tuner
 }
@@ -84,8 +88,17 @@ func (t *MaxConnectionsTuner) Run() {
 			value = MaxMaxConnections
 		}
 		if globalVariables.MaxConnections == value {
+			log.Logger().Debug(fmt.Sprintf("%s tuner continued", t.name),
+				zap.Uint64("globalVariables.MaxConnections", globalVariables.MaxConnections),
+				zap.Uint64("value", value))
 			continue
 		}
+
+		t.sendMessage(Message{
+			Section: "mysqld",
+			Key:     strings.ReplaceAll(t.name, "_", "-"),
+			Value:   fmt.Sprintf("%d", value),
+		})
 
 		_, err = t.db.Exec("SET GLOBAL max_connections = ?", value)
 		if err != nil {

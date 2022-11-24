@@ -7,6 +7,7 @@ import (
 	"mtuned/pkg/log"
 	"mtuned/pkg/notify"
 	"mtuned/pkg/util"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -21,11 +22,12 @@ const (
 
 // InnodbLogBufferSizeTuner tuner for innodb_log_buffer_size param
 type InnodbLogBufferSizeTuner struct {
-	name      string
-	interval  uint
-	ctx       context.Context
-	db        *db.DB
-	notifySvc *notify.Service
+	name        string
+	interval    uint
+	ctx         context.Context
+	db          *db.DB
+	notifySvc   *notify.Service
+	sendMessage func(Message)
 }
 
 // NewInnodbLogBufferSizeTuner returns an instance of InnodbLogBufferSizeTuner
@@ -34,17 +36,19 @@ func NewInnodbLogBufferSizeTuner(
 	db *db.DB,
 	interval uint,
 	notifySvc *notify.Service,
+	sendMessage func(Message),
 ) *InnodbLogBufferSizeTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
 	}
 
 	tuner := &InnodbLogBufferSizeTuner{
-		name:      "innodb_log_buffer_size",
-		interval:  interval,
-		ctx:       ctx,
-		db:        db,
-		notifySvc: notifySvc,
+		name:        "innodb_log_buffer_size",
+		interval:    interval,
+		ctx:         ctx,
+		db:          db,
+		notifySvc:   notifySvc,
+		sendMessage: sendMessage,
 	}
 	return tuner
 }
@@ -91,6 +95,12 @@ func (t *InnodbLogBufferSizeTuner) Run() {
 		} else if value > MaxInnodbLogBufferSize {
 			value = MaxInnodbLogBufferSize
 		}
+
+		t.sendMessage(Message{
+			Section: "mysqld",
+			Key:     strings.ReplaceAll(t.name, "_", "-"),
+			Value:   fmt.Sprintf("%d", value),
+		})
 
 		_, err = t.db.Exec("SET GLOBAL innodb_log_buffer_size = ?", value)
 		if err != nil {

@@ -7,6 +7,7 @@ import (
 	"mtuned/pkg/log"
 	"mtuned/pkg/notify"
 	"mtuned/pkg/util"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -20,11 +21,12 @@ const (
 
 // KeyBufferSizeTuner tuner for key_buffer_size parameter
 type KeyBufferSizeTuner struct {
-	name      string
-	interval  uint
-	ctx       context.Context
-	db        *db.DB
-	notifySvc *notify.Service
+	name        string
+	interval    uint
+	ctx         context.Context
+	db          *db.DB
+	notifySvc   *notify.Service
+	sendMessage func(Message)
 }
 
 // NewKeyBufferSizeTuner returns an instance of KeyBufferSizeTuner
@@ -33,17 +35,19 @@ func NewKeyBufferSizeTuner(
 	db *db.DB,
 	interval uint,
 	notifySvc *notify.Service,
+	sendMessage func(Message),
 ) *KeyBufferSizeTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
 	}
 
 	return &KeyBufferSizeTuner{
-		name:      "key_buffer_size",
-		interval:  interval,
-		ctx:       ctx,
-		db:        db,
-		notifySvc: notifySvc,
+		name:        "key_buffer_size",
+		interval:    interval,
+		ctx:         ctx,
+		db:          db,
+		notifySvc:   notifySvc,
+		sendMessage: sendMessage,
 	}
 }
 
@@ -89,8 +93,17 @@ func (t *KeyBufferSizeTuner) Run() {
 
 		keyBufferSize := util.NextUint64Multiple(globalVariables.TableOpenCache, KeyBufferUnitSize)
 		if keyBufferSize == globalVariables.KeyBufSize {
+			log.Logger().Debug(fmt.Sprintf("%s tuner continued", t.name),
+				zap.Uint64("keyBufferSize", keyBufferSize),
+				zap.Uint64("globalVariables.KeyBufSize", globalVariables.KeyBufSize))
 			continue
 		}
+
+		t.sendMessage(Message{
+			Section: "mysqld",
+			Key:     strings.ReplaceAll(t.name, "_", "-"),
+			Value:   fmt.Sprintf("%d", keyBufferSize),
+		})
 
 		_, err = t.db.Exec("SET GLOBAL key_buffer_size = ?", keyBufferSize)
 		if err != nil {

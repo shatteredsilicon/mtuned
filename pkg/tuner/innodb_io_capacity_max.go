@@ -6,6 +6,7 @@ import (
 	"mtuned/pkg/db"
 	"mtuned/pkg/log"
 	"mtuned/pkg/notify"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -26,6 +27,7 @@ type InnodbIOCapacityMaxTuner struct {
 	ioState       ioState
 	broadcastChan func(unsafe.Pointer) <-chan broadcastData
 	notifySvc     *notify.Service
+	sendMessage   func(Message)
 }
 
 // NewInnodbIOCapacityMaxTuner returns an instance of InnodbIOCapacityMaxTuner
@@ -35,17 +37,19 @@ func NewInnodbIOCapacityMaxTuner(
 	interval uint,
 	listenerRegister func(unsafe.Pointer) func(unsafe.Pointer) <-chan broadcastData,
 	notifySvc *notify.Service,
+	sendMessage func(Message),
 ) *InnodbIOCapacityMaxTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
 	}
 
 	tuner := &InnodbIOCapacityMaxTuner{
-		name:      "innodb_io_capacity_max",
-		interval:  interval,
-		ctx:       ctx,
-		db:        db,
-		notifySvc: notifySvc,
+		name:        "innodb_io_capacity_max",
+		interval:    interval,
+		ctx:         ctx,
+		db:          db,
+		notifySvc:   notifySvc,
+		sendMessage: sendMessage,
 	}
 	tuner.broadcastChan = listenerRegister(unsafe.Pointer(tuner))
 	return tuner
@@ -96,8 +100,17 @@ func (t *InnodbIOCapacityMaxTuner) Run() {
 		}
 
 		if globalVariables.InnodbIOCapacityMax == value {
+			log.Logger().Debug(fmt.Sprintf("%s tuner continued", t.name),
+				zap.Uint64("globalVariables.InnodbIOCapacityMax", globalVariables.InnodbIOCapacityMax),
+				zap.Uint64("value", value))
 			continue
 		}
+
+		t.sendMessage(Message{
+			Section: "mysqld",
+			Key:     strings.ReplaceAll(t.name, "_", "-"),
+			Value:   fmt.Sprintf("%d", value),
+		})
 
 		_, err = t.db.Exec("SET GLOBAL innodb_io_capacity_max = ?", value)
 		if err != nil {

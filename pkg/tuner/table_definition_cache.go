@@ -7,6 +7,7 @@ import (
 	"mtuned/pkg/log"
 	"mtuned/pkg/notify"
 	"mtuned/pkg/util"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -21,11 +22,12 @@ const (
 
 // TableDefinitionCacheTuner tuner for table_definition_cache parameter
 type TableDefinitionCacheTuner struct {
-	name      string
-	interval  uint
-	ctx       context.Context
-	db        *db.DB
-	notifySvc *notify.Service
+	name        string
+	interval    uint
+	ctx         context.Context
+	db          *db.DB
+	notifySvc   *notify.Service
+	sendMessage func(Message)
 }
 
 // NewTableDefinitionCacheTuner returns an instance of TableDefinitionCacheTuner
@@ -34,17 +36,19 @@ func NewTableDefinitionCacheTuner(
 	db *db.DB,
 	interval uint,
 	notifySvc *notify.Service,
+	sendMessage func(Message),
 ) *TableDefinitionCacheTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
 	}
 
 	return &TableDefinitionCacheTuner{
-		name:      "table_definition_cache",
-		interval:  interval,
-		ctx:       ctx,
-		db:        db,
-		notifySvc: notifySvc,
+		name:        "table_definition_cache",
+		interval:    interval,
+		ctx:         ctx,
+		db:          db,
+		notifySvc:   notifySvc,
+		sendMessage: sendMessage,
 	}
 }
 
@@ -87,8 +91,17 @@ func (t *TableDefinitionCacheTuner) Run() {
 		}
 
 		if value == globalVariables.TableDefinitionCache {
+			log.Logger().Debug(fmt.Sprintf("%s tuner continued", t.name),
+				zap.Uint64("globalVariables.TableDefinitionCache", globalVariables.TableDefinitionCache),
+				zap.Uint64("value", value))
 			continue
 		}
+
+		t.sendMessage(Message{
+			Section: "mysqld",
+			Key:     strings.ReplaceAll(t.name, "_", "-"),
+			Value:   fmt.Sprintf("%d", value),
+		})
 
 		_, err = t.db.Exec("SET GLOBAL table_definition_cache = ?", value)
 		if err != nil {

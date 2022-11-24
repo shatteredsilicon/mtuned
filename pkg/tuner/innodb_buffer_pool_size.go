@@ -7,6 +7,7 @@ import (
 	"mtuned/pkg/log"
 	"mtuned/pkg/notify"
 	"mtuned/pkg/util"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,6 +22,7 @@ type InnodbBufPoolSizeTuner struct {
 	db            *db.DB
 	hugePageAlloc uint64
 	notifySvc     *notify.Service
+	sendMessage   func(Message)
 }
 
 // NewInnodbBufPoolSizeTuner returns an instance of InnodbBufPoolSizeTuner
@@ -30,6 +32,7 @@ func NewInnodbBufPoolSizeTuner(
 	interval uint,
 	hugePageAlloc uint64,
 	notifySvc *notify.Service,
+	sendMessage func(Message),
 ) *InnodbBufPoolSizeTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
@@ -42,6 +45,7 @@ func NewInnodbBufPoolSizeTuner(
 		db:            db,
 		hugePageAlloc: hugePageAlloc,
 		notifySvc:     notifySvc,
+		sendMessage:   sendMessage,
 	}
 }
 
@@ -80,22 +84,38 @@ func (t *InnodbBufPoolSizeTuner) Run() {
 			continue
 		}
 
+		expectedRAM := uint64(float64(sysInfo.Totalram)*0.9) * 1024
+
 		var size uint64
 		if globalVariables.InnodbBufferPoolSize > innodbSize {
 			size = innodbSize
-		} else if globalVariables.MaxMemoryUsage() != uint64(float64(sysInfo.Totalram)*0.9) {
-			size = uint64(float64(sysInfo.Totalram) * 0.9)
+		} else if globalVariables.MaxMemoryUsage() != expectedRAM {
+			size = expectedRAM
 		}
+
+		size = util.NextUint64Multiple(size, globalVariables.InnodbBufPoolInsts*globalVariables.InnodbBufPoolChunkSize)
 
 		if globalVariables.LargePages && t.hugePageAlloc > 0 && size < t.hugePageAlloc {
-			size = t.hugePageAlloc
-		}
-
-		size = util.NextUint64Multiple(size,
-			globalVariables.InnodbBufPoolInsts*globalVariables.InnodbBufPoolChunkSize)
-		if size == globalVariables.InnodbBufferPoolSize {
+			t.notifySvc.Notify(notify.Message{
+				Subject: fmt.Sprintf("innodb_buffer_pool_size adjustment warning"),
+				Content: fmt.Sprintf("trying to reduce innodb buffer pool below huge page (value = %d, huge page allocation = %d, InnoDB data size = %d)", size, t.hugePageAlloc, innodbSize),
+				Time:    time.Now(),
+			})
 			continue
 		}
+
+		if size == globalVariables.InnodbBufferPoolSize {
+			log.Logger().Debug(fmt.Sprintf("%s tuner continued", t.name),
+				zap.Uint64("globalVariables.InnodbBufferPoolSize", globalVariables.InnodbBufferPoolSize),
+				zap.Uint64("size", size))
+			continue
+		}
+
+		t.sendMessage(Message{
+			Section: "mysqld",
+			Key:     strings.ReplaceAll(t.name, "_", "-"),
+			Value:   util.Uint64ToSizeString(size),
+		})
 
 		_, err = t.db.Exec("SET GLOBAL innodb_buffer_pool_size = ?", size)
 		if err != nil {

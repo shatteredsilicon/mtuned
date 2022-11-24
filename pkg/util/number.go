@@ -1,8 +1,20 @@
 package util
 
+import "fmt"
+
 const (
 	// MaxUint64 Max uint64 value
 	MaxUint64 = ^uint64(0)
+)
+
+const (
+	_ = iota
+	// KB kilobyte
+	KB = 1 << (10 * iota)
+	// MB megabyte
+	MB
+	// GB gigabyte
+	GB
 )
 
 // NextUint64Multiple returns next multiple of 'base'
@@ -45,4 +57,18 @@ func NextPowerOfTwo(current uint64) uint64 {
 	}
 
 	return 0
+}
+
+// Uint64ToSizeString round down number to nearest
+// GB/MB/KB/B and returns the readable string
+func Uint64ToSizeString(number uint64) string {
+	if number >= GB {
+		return fmt.Sprintf("%dG", number/GB)
+	} else if number >= MB {
+		return fmt.Sprintf("%dM", number/MB)
+	} else if number >= KB {
+		return fmt.Sprintf("%dK", number/KB)
+	} else {
+		return fmt.Sprintf("%dB", number)
+	}
 }

@@ -5,6 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"mtuned/pkg/config"
 	"mtuned/pkg/db"
@@ -32,7 +35,7 @@ func main() {
 	// Load config
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Panic("Initialize config package failed: ", err)
+		log.Panic("Load config file failed: ", err)
 	}
 
 	// Init db
@@ -63,7 +66,8 @@ func main() {
 	}
 	go runNotify()
 
-	tunerSvc, err := tuner.NewService(context.Background(), cfg, notifySvc)
+	ctx, cancel := context.WithCancel(context.Background())
+	tunerSvc, err := tuner.NewService(ctx, cfg, notifySvc)
 	if err != nil {
 		log.Panic(err)
 	}
@@ -82,12 +86,17 @@ func main() {
 	}
 	go runTuner()
 
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	for {
 		select {
 		case <-notifyChan:
 			go runNotify()
 		case <-tunerChan:
 			go runTuner()
+		case <-sigs:
+			cancel()
+			os.Exit(0)
 		}
 	}
 }

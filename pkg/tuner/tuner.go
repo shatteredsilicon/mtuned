@@ -10,6 +10,7 @@ import (
 	"mtuned/pkg/log"
 	"mtuned/pkg/notify"
 	"mtuned/pkg/util"
+	"os"
 	"os/exec"
 	"regexp"
 	"sort"
@@ -19,6 +20,7 @@ import (
 	"unsafe"
 
 	"go.uber.org/zap"
+	"gopkg.in/ini.v1"
 )
 
 const (
@@ -50,17 +52,28 @@ type device struct {
 }
 
 type service struct {
-	ctx           context.Context
-	tuners        []Tuner
-	storage       uint8
-	broadcastChan chan broadcastData
-	ioState       ioState
-	listenerMap   map[unsafe.Pointer]struct{}
-	device        device
-	bold          bool
-	db            *db.DB
-	notifySvc     *notify.Service
-	hpAlloc       uint64
+	ctx            context.Context
+	tuners         []Tuner
+	storage        uint8
+	broadcastChan  chan broadcastData
+	ioState        ioState
+	listenerMap    map[unsafe.Pointer]struct{}
+	device         device
+	bold           bool
+	db             *db.DB
+	notifySvc      *notify.Service
+	hpAlloc        uint64
+	tuneUpdated    bool
+	ini            *ini.File
+	queue          chan Message
+	PersistentTune string
+}
+
+// Message message sent to queue
+type Message struct {
+	Section string
+	Key     string
+	Value   string
 }
 
 type broadcastData struct {
@@ -77,10 +90,22 @@ type Service struct {
 func NewService(ctx context.Context, cfg *config.Config, notifySvc *notify.Service) (*Service, error) {
 	pool := db.NewDB()
 
+	if _, err := os.Stat(cfg.PersistentTune); errors.Is(err, os.ErrNotExist) {
+		_, err = os.OpenFile(cfg.PersistentTune, os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	ini, err := ini.Load(cfg.PersistentTune)
+	if err != nil {
+		return nil, err
+	}
+
 	var dataDir struct {
 		Path string `db:"@@datadir"`
 	}
-	err := pool.Get(&dataDir, "SELECT @@datadir;")
+	err = pool.Get(&dataDir, "SELECT @@datadir;")
 	if err != nil {
 		return nil, err
 	}
@@ -108,30 +133,33 @@ func NewService(ctx context.Context, cfg *config.Config, notifySvc *notify.Servi
 
 	svc := &Service{
 		service: service{
-			ctx:         ctx,
-			storage:     uint8(storage),
-			listenerMap: make(map[unsafe.Pointer]struct{}),
-			device:      *dev,
-			bold:        cfg.Bold,
-			db:          pool,
-			notifySvc:   notifySvc,
-			hpAlloc:     hpAlloc,
+			ctx:            ctx,
+			storage:        uint8(storage),
+			listenerMap:    make(map[unsafe.Pointer]struct{}),
+			device:         *dev,
+			bold:           cfg.Bold,
+			db:             pool,
+			notifySvc:      notifySvc,
+			hpAlloc:        hpAlloc,
+			ini:            ini,
+			queue:          make(chan Message, 10),
+			PersistentTune: cfg.PersistentTune,
 		},
 	}
 
 	svc.tuners = []Tuner{
-		NewMaxConnectionsTuner(ctx, pool, cfg.Interval.MaxConnections, notifySvc),
-		NewInnodbBufPoolSizeTuner(ctx, pool, cfg.Interval.InnodbBufPoolSize, hpAlloc, notifySvc),
-		NewTableOpenCacheTuner(ctx, pool, cfg.Interval.TableOpenCache, notifySvc),
-		NewKeyBufferSizeTuner(ctx, pool, cfg.Interval.KeyBufSize, notifySvc),
-		NewTableDefinitionCacheTuner(ctx, pool, cfg.Interval.TableDefCache, notifySvc),
-		NewInnodbFlushNeighborsTuner(ctx, pool, cfg.Interval.InnodbflushNBR, storage, notifySvc),
-		NewInnodbBufPoolInstsTuner(ctx, pool, cfg.Interval.InnodbBufPoolInst, notifySvc),
-		NewInnodbIOCapacityMaxTuner(ctx, pool, cfg.Interval.InnodbIOCapMax, svc.listenerRegister, notifySvc),
-		NewTableOpenCacheInstsTuner(ctx, pool, cfg.Interval.TableOpenCacheInst, notifySvc),
-		NewInnodbIOCapacityTuner(ctx, pool, cfg.Interval.InnodbIOCap, notifySvc),
-		NewInnodbLogBufferSizeTuner(ctx, pool, cfg.Interval.InnodbLogBufSize, notifySvc),
-		NewInnodbLogFileSizeTuner(ctx, pool, cfg.Interval.InnodbLogFileSize, notifySvc),
+		NewMaxConnectionsTuner(ctx, pool, cfg.Interval.MaxConnections, notifySvc, svc.SendMessage),
+		NewInnodbBufPoolSizeTuner(ctx, pool, cfg.Interval.InnodbBufPoolSize, hpAlloc, notifySvc, svc.SendMessage),
+		NewTableOpenCacheTuner(ctx, pool, cfg.Interval.TableOpenCache, notifySvc, svc.SendMessage),
+		NewKeyBufferSizeTuner(ctx, pool, cfg.Interval.KeyBufSize, notifySvc, svc.SendMessage),
+		NewTableDefinitionCacheTuner(ctx, pool, cfg.Interval.TableDefCache, notifySvc, svc.SendMessage),
+		NewInnodbFlushNeighborsTuner(ctx, pool, cfg.Interval.InnodbflushNBR, storage, notifySvc, svc.SendMessage),
+		NewInnodbBufPoolInstsTuner(ctx, pool, cfg.Interval.InnodbBufPoolInst, notifySvc, svc.SendMessage),
+		NewInnodbIOCapacityMaxTuner(ctx, pool, cfg.Interval.InnodbIOCapMax, svc.listenerRegister, notifySvc, svc.SendMessage),
+		NewTableOpenCacheInstsTuner(ctx, pool, cfg.Interval.TableOpenCacheInst, notifySvc, svc.SendMessage),
+		NewInnodbIOCapacityTuner(ctx, pool, cfg.Interval.InnodbIOCap, notifySvc, svc.SendMessage),
+		NewInnodbLogBufferSizeTuner(ctx, pool, cfg.Interval.InnodbLogBufSize, notifySvc, svc.SendMessage),
+		NewInnodbLogFileSizeTuner(ctx, pool, cfg.Interval.InnodbLogFileSize, notifySvc, svc.SendMessage),
 	}
 	svc.broadcastChan = make(chan broadcastData, len(svc.listenerMap))
 
@@ -149,6 +177,20 @@ func (s *Service) Run() {
 		go tuner.Run()
 	}
 
+	persistChan := make(chan interface{})
+	runPersist := func() {
+		defer func() {
+			r := recover()
+			if r != nil {
+
+			}
+			persistChan <- r
+		}()
+
+		s.persist(s.ctx)
+	}
+	go runPersist()
+
 	for {
 		ticker := time.NewTicker(2 * time.Duration(DefaultTuneInterval) * time.Second)
 
@@ -156,10 +198,43 @@ func (s *Service) Run() {
 		case <-ticker.C:
 		case <-s.ctx.Done():
 			return
+		case <-persistChan:
+			go runPersist()
 		}
 
 		s.inferIOState()
 	}
+}
+
+func (s *Service) persist(ctx context.Context) {
+	for {
+		select {
+		case <-time.NewTimer(time.Millisecond).C:
+			if !s.tuneUpdated {
+				continue
+			}
+
+			err := s.ini.SaveTo(s.PersistentTune)
+			if err != nil {
+				log.Logger().Error("Save config to file failed", zap.NamedError("error", err))
+			} else {
+				s.tuneUpdated = false
+			}
+		case msg := <-s.queue:
+			s.ini.Section(msg.Section).Key(msg.Key).SetValue(msg.Value)
+			s.tuneUpdated = true
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// SendMessage sends message to queue
+func (s *Service) SendMessage(msg Message) {
+	if s.queue == nil {
+		return
+	}
+	s.queue <- msg
 }
 
 func (s *Service) broadcast(data broadcastData) {
@@ -414,19 +489,34 @@ func (s *Service) tuneQueryCache() {
 	var queries []string
 	var subjects []string
 	var contents []string
+	var messages []Message
 	for _, row := range rows {
 		if row.Name == "query_cache_size" && row.Value != "0" {
 			queries = append(queries, "query_cache_size = 0")
 			subjects = append(subjects, fmt.Sprintf("%s changed", row.Name))
 			contents = append(contents, fmt.Sprintf("%s has been changed from %s to %s", row.Name, row.Value, "0"))
+			messages = append(messages, Message{
+				Section: "mysqld",
+				Key:     "query-cache-size",
+				Value:   "0",
+			})
 		} else if row.Name == "query_cache_type" && row.Value != "0" {
 			queries = append(queries, "query_cache_type = 0")
 			subjects = append(subjects, fmt.Sprintf("%s changed", row.Name))
 			contents = append(contents, fmt.Sprintf("%s has been changed from %s to %s", row.Name, row.Value, "0"))
+			messages = append(messages, Message{
+				Section: "mysqld",
+				Key:     "query-cache-type",
+				Value:   "0",
+			})
 		}
 	}
 	if len(queries) == 0 {
 		return
+	}
+
+	for _, msg := range messages {
+		s.SendMessage(msg)
 	}
 
 	_, err = s.db.Exec(fmt.Sprintf("SET GLOBAL %s;", strings.Join(queries, ", ")))
@@ -516,28 +606,58 @@ func (s *Service) tuneZFS() {
 
 	queries := []string{}
 	notifyLines = []string{}
+	var messages []Message
 	if globalVariables.InnodbChecksumAlgo != "none" {
 		queries = append(queries, fmt.Sprintf("innodb_checksum_algorithm='none'"))
 		notifyLines = append(notifyLines, fmt.Sprintf("innodb_checksum_algorithm: %s -> none", globalVariables.InnodbChecksumAlgo))
+		messages = append(messages, Message{
+			Section: "mysqld",
+			Key:     "innodb-checksum-algorithm",
+			Value:   "none",
+		})
 	}
 	dbw := util.ParseBool(globalVariables.InnodbDoubleWrite)
 	if dbw == nil || *dbw {
 		notifyLines = append(notifyLines, "innodb_doublewrite: ON -> OFF")
+		messages = append(messages, Message{
+			Section: "mysqld",
+			Key:     "innodb-doublewrite",
+			Value:   "0",
+		})
 	}
 	if globalVariables.InnodbFlushNeighbors != 0 {
 		queries = append(queries, fmt.Sprintf("innodb_flush_neighbors=0"))
 		notifyLines = append(notifyLines, fmt.Sprintf("innodb_flush_neighbors: %d -> 0", globalVariables.InnodbFlushNeighbors))
+		messages = append(messages, Message{
+			Section: "mysqld",
+			Key:     "innodb-flush-neighbors",
+			Value:   "0",
+		})
 	}
 	if globalVariables.InnodbUseNativeAIO {
 		notifyLines = append(notifyLines, "innodb_use_native_aio: ON -> OFF")
+		messages = append(messages, Message{
+			Section: "mysqld",
+			Key:     "innodb-use-native-aio",
+			Value:   "0",
+		})
 	}
 	if globalVariables.InnodbLogWriteAheadSize != uint64(globalVariables.InnodbPageSize) {
 		queries = append(queries, fmt.Sprintf("innodb_write_ahead_size=%d", globalVariables.InnodbPageSize))
 		notifyLines = append(notifyLines, fmt.Sprintf("innodb_doublewrite: %d -> %d", globalVariables.InnodbLogWriteAheadSize, globalVariables.InnodbPageSize))
+		messages = append(messages, Message{
+			Section: "mysqld",
+			Key:     "innodb-write-ahead-size",
+			Value:   util.Uint64ToSizeString(uint64(globalVariables.InnodbPageSize)),
+		})
 	}
 
 	if len(queries) == 0 {
 		return
+	}
+
+	for _, msg := range messages {
+		s.SendMessage(msg)
 	}
 
 	// set global variables

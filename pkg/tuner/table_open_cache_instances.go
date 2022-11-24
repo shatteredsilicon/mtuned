@@ -7,6 +7,7 @@ import (
 	"mtuned/pkg/log"
 	"mtuned/pkg/notify"
 	"runtime"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -21,12 +22,13 @@ const (
 
 // TableOpenCacheInstsTuner tuner for table_open_cache_instances parameter
 type TableOpenCacheInstsTuner struct {
-	name      string
-	interval  uint
-	ctx       context.Context
-	value     *uint64
-	db        *db.DB
-	notifySvc *notify.Service
+	name        string
+	interval    uint
+	ctx         context.Context
+	value       *uint64
+	db          *db.DB
+	notifySvc   *notify.Service
+	sendMessage func(Message)
 }
 
 // NewTableOpenCacheInstsTuner returns an instance of TableOpenCacheInstsTuner
@@ -35,17 +37,19 @@ func NewTableOpenCacheInstsTuner(
 	db *db.DB,
 	interval uint,
 	notifySvc *notify.Service,
+	sendMessage func(Message),
 ) *TableOpenCacheInstsTuner {
 	if interval == 0 {
 		interval = DefaultTuneInterval
 	}
 
 	return &TableOpenCacheInstsTuner{
-		name:      "table_open_cache_instances",
-		interval:  interval,
-		ctx:       ctx,
-		db:        db,
-		notifySvc: notifySvc,
+		name:        "table_open_cache_instances",
+		interval:    interval,
+		ctx:         ctx,
+		db:          db,
+		notifySvc:   notifySvc,
+		sendMessage: sendMessage,
 	}
 }
 
@@ -91,6 +95,12 @@ func (t *TableOpenCacheInstsTuner) Run() {
 				zap.Uint64p("t.value", t.value))
 			continue
 		}
+
+		t.sendMessage(Message{
+			Section: "mysqld",
+			Key:     strings.ReplaceAll(t.name, "_", "-"),
+			Value:   fmt.Sprintf("%d", size),
+		})
 
 		t.value = &size
 		now := time.Now()
